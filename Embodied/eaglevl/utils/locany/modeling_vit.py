@@ -8,15 +8,16 @@
 
 import math
 from copy import deepcopy
-from typing import Union, Tuple, Sequence, Optional, List
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 try:
     from transformers.activations import PytorchGELUTanh
 except ImportError:
-    PytorchGELUTanh = lambda: nn.GELU(approximate='tanh')
+    PytorchGELUTanh = lambda: nn.GELU(approximate="tanh")
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import is_flash_attn_2_available, logging
 
@@ -26,7 +27,6 @@ else:
     flash_attn_varlen_func = None
 
 from transformers.configuration_utils import PretrainedConfig
-
 
 logger = logging.get_logger(__name__)
 
@@ -133,23 +133,29 @@ def sdpa_attention(
     Args:
         q, k, v: tensor of shape (batch_size, seqlen, num_heads, head_dim),
             or (tot_seqlens, num_heads, head_dim) if packing.
+
+    The packed sequence is attention-isolated per image (the original mask is
+    block-diagonal over ``cu_seqlens``). Materializing that dense ``[S, S]`` mask
+    is ``O(S^2)`` in the *total* packed length, which OOMs once several images are
+    packed together for batched inference. Instead, run full self-attention on
+    each image's slice independently: identical numerics, but memory is
+    ``sum_i n_i^2`` rather than ``(sum_i n_i)^2``.
     """
     seq_length = q.shape[0]
-    attention_mask = torch.zeros(
-        [1, seq_length, seq_length], device=q.device, dtype=torch.bool
-    )
-    for i in range(1, len(q_cu_seqlens)):
-        attention_mask[
-            ...,
-            q_cu_seqlens[i - 1] : q_cu_seqlens[i],
-            q_cu_seqlens[i - 1] : q_cu_seqlens[i],
-        ] = True
-    q = q.transpose(0, 1)
-    k = k.transpose(0, 1)
-    v = v.transpose(0, 1)
-    attn_output = F.scaled_dot_product_attention(q, k, v, attention_mask, dropout_p=0.0)
-    attn_output = attn_output.transpose(0, 1)
-    attn_output = attn_output.reshape(seq_length, -1)
+    outs = []
+    # One host transfer of the (tiny) cu_seqlens tensor instead of 2x int(tensor[i])
+    # host syncs per image per call -- the per-element .item()s serialize the GPU
+    # pipeline on every ViT layer of every forward. Slice values are identical, so
+    # the output is bit-for-bit unchanged (see test_modeling_vit).
+    cu = q_cu_seqlens.tolist()
+    for i in range(1, len(cu)):
+        s, e = cu[i - 1], cu[i]
+        qi = q[s:e].transpose(0, 1)  # [num_heads, n_i, head_dim]
+        ki = k[s:e].transpose(0, 1)
+        vi = v[s:e].transpose(0, 1)
+        oi = F.scaled_dot_product_attention(qi, ki, vi, dropout_p=0.0)
+        outs.append(oi.transpose(0, 1))  # [n_i, num_heads, head_dim]
+    attn_output = torch.cat(outs, dim=0).reshape(seq_length, -1)
     return attn_output
 
 
@@ -555,9 +561,7 @@ def patch_merger(
             new_height, kernel_height, new_width, kernel_width, d_model
         )
         reshaped_seq = reshaped_seq.permute(0, 2, 1, 3, 4).contiguous()
-        padded_seq = reshaped_seq.view(
-            new_height * new_width, -1
-        )
+        padded_seq = reshaped_seq.view(new_height * new_width, -1)
         outputs.append(padded_seq)
         pre_sum += height * width
 
