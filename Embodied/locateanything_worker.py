@@ -135,9 +135,9 @@ class LocateAnythingWorker:
         use ``temperature=0`` (greedy) for reproducible/comparable output.
 
         ``profile``, if given an empty dict, is filled in-place with a per-step
-        timing breakdown (``step0_eject`` .. ``step5_compact``, ``n_steps``,
-        ``A_history``) accumulated across the whole decode loop. ``None``
-        (default) adds no overhead.
+        timing breakdown (``step1_assemble`` .. ``step5_compact``, ``n_steps``)
+        accumulated across the whole decode loop. ``None`` (default) adds no
+        overhead.
 
         ``runaway_box_run``/``runaway_box_max_delta`` tune the guard that stops
         a row early if it emits a long run of near-identical adjacent

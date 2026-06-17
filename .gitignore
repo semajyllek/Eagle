@@ -44,3 +44,7 @@ unit_test*.*
 
 
 
+
+# Local MPS test venv(s) -- not part of the repo
+.venv-mps/
+.venv*/
